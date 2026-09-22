@@ -3,6 +3,8 @@ import json
 from app.redis_client import redis_client
 
 STREAM_NAME = "cerberus:jobs"
+GROUP_NAME = "cerberus-workers"
+CONSUMER_NAME = "worker-1"
 
 def process_job(job):
     print("\n--- Processing Job ---")
@@ -16,16 +18,19 @@ def process_job(job):
 
 
 def main():
-    last_id = "0-0"
 
     print("Cerberus worker started...")
     print(f"Listening to stream: {STREAM_NAME}")
+    print(f"Consumer group: {GROUP_NAME}")
+    print(f"Consumer name: {CONSUMER_NAME}")
 
     while True:
-        messages = redis_client.xread(
-            {STREAM_NAME: last_id},
-            block=0,
-            count=1
+        messages = redis_client.xreadgroup(
+            groupname=GROUP_NAME,
+            consumername=CONSUMER_NAME,
+            streams={STREAM_NAME: ">"},
+            count=1,
+            block=0
         )
 
         for stream_name, entries in messages:
@@ -34,8 +39,6 @@ def main():
                 print("Received message:", message_id)
 
                 process_job(job)
-
-                last_id = message_id
 
 
 if __name__ == "__main__":
