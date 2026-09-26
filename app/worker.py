@@ -1,11 +1,16 @@
 import json
+import sys
 
 from app.redis_client import redis_client
 
-
 STREAM_NAME = "cerberus:jobs"
 GROUP_NAME = "cerberus-workers"
-CONSUMER_NAME = "worker-1"
+
+if len(sys.argv) < 2:
+    print("Usage: python -m app.worker <worker-name>")
+    sys.exit(1)
+
+CONSUMER_NAME = sys.argv[1]
 
 
 def process_job(job):
@@ -20,7 +25,6 @@ def process_job(job):
 
 
 def main():
-
     print("Cerberus worker started...")
     print(f"Listening to stream: {STREAM_NAME}")
     print(f"Consumer group: {GROUP_NAME}")
@@ -33,7 +37,7 @@ def main():
             consumername=CONSUMER_NAME,
             streams={STREAM_NAME: ">"},
             count=1,
-            block=0
+            block=5000
         )
 
         for stream_name, entries in messages:
@@ -43,10 +47,8 @@ def main():
                 print("Received message:", message_id)
 
                 try:
-                    # 1. Process the job
                     process_job(job)
 
-                    # 2. Tell Redis that processing succeeded
                     redis_client.xack(
                         STREAM_NAME,
                         GROUP_NAME,
@@ -56,11 +58,7 @@ def main():
                     print("Job ACKed:", message_id)
 
                 except Exception as error:
-
                     print("Job failed:", error)
-
-                    # IMPORTANT:
-                    # Do NOT ACK failed jobs.
 
 
 if __name__ == "__main__":
