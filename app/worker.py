@@ -1,6 +1,8 @@
 import json
 import sys
 
+import time
+
 from app.redis_client import redis_client
 
 STREAM_NAME = "cerberus:jobs"
@@ -13,6 +15,19 @@ if len(sys.argv) < 2:
 CONSUMER_NAME = sys.argv[1]
 
 
+# def process_job(job):
+#     print("\n--- Processing Job ---")
+#     print("Job ID:", job["job_id"])
+#     print("Type:", job["type"])
+
+#     payload = json.loads(job["payload"])
+#     print("Payload:", payload)
+
+#     print("--- Job Completed ---\n")
+
+
+
+# temporary (a bit long job so that we can kill the worker)
 def process_job(job):
     print("\n--- Processing Job ---")
     print("Job ID:", job["job_id"])
@@ -21,8 +36,11 @@ def process_job(job):
     payload = json.loads(job["payload"])
     print("Payload:", payload)
 
-    print("--- Job Completed ---\n")
+    print("--- Job is being processed for 30 seconds ---")
 
+    time.sleep(30)
+
+    print("--- Job Completed ---\n")
 
 def main():
     print("Cerberus worker started...")
