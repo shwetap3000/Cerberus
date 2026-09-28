@@ -26,7 +26,8 @@ def create_job(job: JobRequest):
         {
             "job_id": job_id,
             "type": job.type,
-            "payload": payload
+            "payload": payload,
+            "attempt": "0"
         }
     )
 

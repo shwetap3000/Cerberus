@@ -27,6 +27,10 @@ def process_job(job):
     payload = json.loads(job["payload"])
     print("Payload:", payload)
 
+    # Temporary failure test
+    if job["type"] == "fail":
+        raise Exception("Intentional test failure")
+
     print("--- Job Completed ---\n")
 
 
@@ -38,8 +42,10 @@ def handle_job(message_id, job):
     print("Received message:", message_id)
 
     try:
+        # Try to process the job
         process_job(job)
 
+        # Processing succeeded, so ACK the message
         redis_client.xack(
             STREAM_NAME,
             GROUP_NAME,
@@ -49,7 +55,34 @@ def handle_job(message_id, job):
         print("Job ACKed:", message_id)
 
     except Exception as error:
+        # The worker is alive, but the job execution failed
         print("Job failed:", error)
+
+        # Get the current attempt number
+        current_attempt = int(job.get("attempt", "0"))
+
+        # Increase the attempt number for the retry
+        next_attempt = current_attempt + 1
+
+        # ACK the original failed delivery
+        redis_client.xack(
+            STREAM_NAME,
+            GROUP_NAME,
+            message_id
+        )
+
+        # Create a new Redis Stream message for the retry
+        redis_client.xadd(
+            STREAM_NAME,
+            {
+                "job_id": job["job_id"],
+                "type": job["type"],
+                "payload": job["payload"],
+                "attempt": str(next_attempt)
+            }
+        )
+
+        print("Retry scheduled:", next_attempt)
 
 
 def reclaim_pending_jobs():
