@@ -1,11 +1,15 @@
 import json
 import sys
+import time 
 
 from app.redis_client import redis_client
 
 
 STREAM_NAME = "cerberus:jobs"
 GROUP_NAME = "cerberus-workers"
+
+RETRY_ZSET = "cerberus:retries"
+RETRY_DELAY = 5
 
 # For now, a pending job must be idle for at least 5 seconds
 # before another worker can reclaim it.
@@ -55,35 +59,35 @@ def handle_job(message_id, job):
         print("Job ACKed:", message_id)
 
     except Exception as error:
-        # The worker is alive, but the job execution failed
         print("Job failed:", error)
 
-        # Get the current attempt number
         current_attempt = int(job.get("attempt", "0"))
-
-        # Increase the attempt number for the retry
         next_attempt = current_attempt + 1
 
-        # ACK the original failed delivery
+        retry_at = time.time() + RETRY_DELAY
+
+        retry_job = {
+            "job_id": job["job_id"],
+            "type": job["type"],
+            "payload": job["payload"],
+            "attempt": str(next_attempt)
+        }
+
         redis_client.xack(
             STREAM_NAME,
             GROUP_NAME,
             message_id
         )
 
-        # Create a new Redis Stream message for the retry
-        redis_client.xadd(
-            STREAM_NAME,
+        redis_client.zadd(
+            RETRY_ZSET,
             {
-                "job_id": job["job_id"],
-                "type": job["type"],
-                "payload": job["payload"],
-                "attempt": str(next_attempt)
+                json.dumps(retry_job): retry_at
             }
         )
 
         print("Retry scheduled:", next_attempt)
-
+        print("Retry time:", retry_at)
 
 def reclaim_pending_jobs():
     """
