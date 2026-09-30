@@ -9,7 +9,8 @@ STREAM_NAME = "cerberus:jobs"
 GROUP_NAME = "cerberus-workers"
 
 RETRY_ZSET = "cerberus:retries"
-RETRY_DELAY = 5
+# RETRY_DELAY = 5
+BASE_RETRY_DELAY = 1
 
 # For now, a pending job must be idle for at least 5 seconds
 # before another worker can reclaim it.
@@ -64,7 +65,8 @@ def handle_job(message_id, job):
         current_attempt = int(job.get("attempt", "0"))
         next_attempt = current_attempt + 1
 
-        retry_at = time.time() + RETRY_DELAY
+        retry_delay = BASE_RETRY_DELAY * (2 ** (next_attempt - 1))
+        retry_at = time.time() + retry_delay
 
         retry_job = {
             "job_id": job["job_id"],
@@ -87,6 +89,7 @@ def handle_job(message_id, job):
         )
 
         print("Retry scheduled:", next_attempt)
+        print("Retry delay:", retry_delay, "seconds")
         print("Retry time:", retry_at)
 
 def reclaim_pending_jobs():
