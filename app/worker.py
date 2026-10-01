@@ -1,28 +1,25 @@
 import json
 import sys
-import time 
+import time
 
 from app.redis_client import redis_client
-
 
 STREAM_NAME = "cerberus:jobs"
 GROUP_NAME = "cerberus-workers"
 
 RETRY_ZSET = "cerberus:retries"
-# RETRY_DELAY = 5
 BASE_RETRY_DELAY = 1
+MAX_ATTEMPTS = 5
 
 # For now, a pending job must be idle for at least 5 seconds
 # before another worker can reclaim it.
 MIN_IDLE_TIME = 5000
-
 
 if len(sys.argv) < 2:
     print("Usage: python -m app.worker <worker-name>")
     sys.exit(1)
 
 CONSUMER_NAME = sys.argv[1]
-
 
 def process_job(job):
     print("\n--- Processing Job ---")
@@ -37,7 +34,6 @@ def process_job(job):
         raise Exception("Intentional test failure")
 
     print("--- Job Completed ---\n")
-
 
 def handle_job(message_id, job):
     """
@@ -63,9 +59,30 @@ def handle_job(message_id, job):
         print("Job failed:", error)
 
         current_attempt = int(job.get("attempt", "0"))
+
+        # Maximum number of total executions has been reached
+        if current_attempt >= MAX_ATTEMPTS - 1:
+            print("Maximum attempts reached. Job will not be retried.")
+
+            # Remove the failed message from the Pending Entries List
+            redis_client.xack(
+                STREAM_NAME,
+                GROUP_NAME,
+                message_id
+            )
+
+            return
+
+        # Schedule the next attempt
         next_attempt = current_attempt + 1
 
+        # Exponential backoff:
+        # attempt 1 -> 1 second
+        # attempt 2 -> 2 seconds
+        # attempt 3 -> 4 seconds
+        # attempt 4 -> 8 seconds
         retry_delay = BASE_RETRY_DELAY * (2 ** (next_attempt - 1))
+
         retry_at = time.time() + retry_delay
 
         retry_job = {
@@ -75,12 +92,15 @@ def handle_job(message_id, job):
             "attempt": str(next_attempt)
         }
 
+        # The current execution is finished.
+        # ACK the current Redis Stream message.
         redis_client.xack(
             STREAM_NAME,
             GROUP_NAME,
             message_id
         )
 
+        # Put the next attempt into the retry Sorted Set.
         redis_client.zadd(
             RETRY_ZSET,
             {
@@ -108,7 +128,6 @@ def reclaim_pending_jobs():
     )
 
     return result
-
 
 def main():
     print("Cerberus worker started...")
@@ -146,7 +165,6 @@ def main():
 
             for message_id, job in entries:
                 handle_job(message_id, job)
-
 
 if __name__ == "__main__":
     main()
