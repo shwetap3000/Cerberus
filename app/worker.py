@@ -8,6 +8,8 @@ STREAM_NAME = "cerberus:jobs"
 GROUP_NAME = "cerberus-workers"
 
 RETRY_ZSET = "cerberus:retries"
+DLQ_STREAM_NAME = "cerberus:dlq"
+
 BASE_RETRY_DELAY = 1
 MAX_ATTEMPTS = 5
 
@@ -62,15 +64,31 @@ def handle_job(message_id, job):
 
         # Maximum number of total executions has been reached
         if current_attempt >= MAX_ATTEMPTS - 1:
-            print("Maximum attempts reached. Job will not be retried.")
+            print("Maximum attempts reached.")
+            print("Moving job to Dead Letter Queue.")
 
-            # Remove the failed message from the Pending Entries List
+            # Store the permanently failed job
+            # in the Dead Letter Queue.
+            redis_client.xadd(
+                DLQ_STREAM_NAME,
+                {
+                    "job_id": job["job_id"],
+                    "type": job["type"],
+                    "payload": job["payload"],
+                    "attempt": job.get("attempt", "0"),
+                    "reason": "maximum_attempts_exceeded"
+                }
+            )
+
+            # The original message is no longer being processed,
+            # so remove it from the Pending Entries List.
             redis_client.xack(
                 STREAM_NAME,
                 GROUP_NAME,
                 message_id
             )
 
+            print("Job moved to DLQ:", job["job_id"])
             return
 
         # Schedule the next attempt
@@ -138,21 +156,23 @@ def main():
     while True:
 
         # 1. Recover abandoned/pending jobs
-
         reclaimed = reclaim_pending_jobs()
 
         next_start_id = reclaimed[0]
         messages = reclaimed[1]
 
         for message_id, job in messages:
+
             print("\n--- Reclaimed Pending Job ---")
             print("Message ID:", message_id)
-            print("Previous job owner has been replaced by:", CONSUMER_NAME)
+            print(
+                "Previous job owner has been replaced by:",
+                CONSUMER_NAME
+            )
 
             handle_job(message_id, job)
 
         # 2. Read new jobs
-
         messages = redis_client.xreadgroup(
             groupname=GROUP_NAME,
             consumername=CONSUMER_NAME,
