@@ -9,6 +9,7 @@ GROUP_NAME = "cerberus-workers"
 
 RETRY_ZSET = "cerberus:retries"
 DLQ_STREAM_NAME = "cerberus:dlq"
+IDEMPOTENCY_PREFIX = "cerberus:processed:"
 
 BASE_RETRY_DELAY = 1
 MAX_ATTEMPTS = 5
@@ -37,6 +38,27 @@ def process_job(job):
 
     print("--- Job Completed ---\n")
 
+def check_idempotency(job_id):
+    """
+    Check whether this job has already been successfully processed.
+    """
+
+    key = f"{IDEMPOTENCY_PREFIX}{job_id}"
+
+    return redis_client.exists(key) == 1
+
+def mark_job_processed(job_id):
+    """
+    Mark a job as successfully processed.
+    """
+
+    key = f"{IDEMPOTENCY_PREFIX}{job_id}"
+
+    redis_client.set(
+        key,
+        "1"
+    )
+
 def handle_job(message_id, job):
     """
     Process a job and ACK it after successful processing.
@@ -44,11 +66,37 @@ def handle_job(message_id, job):
 
     print("Received message:", message_id)
 
+    # 1. Idempotency check
+    if check_idempotency(job["job_id"]):
+
+        print(
+            "Job already processed. "
+            "Skipping:",
+            job["job_id"]
+        )
+
+        # This delivery does not need to be processed again.
+        redis_client.xack(
+            STREAM_NAME,
+            GROUP_NAME,
+            message_id
+        )
+
+        return
+
     try:
-        # Try to process the job
+        # 2. Process the job
         process_job(job)
 
-        # Processing succeeded, so ACK the message
+        # 3. Processing succeeded
+        mark_job_processed(job["job_id"])
+
+        print(
+            "Job marked as processed:",
+            job["job_id"]
+        )
+
+        # ACK only after successful processing
         redis_client.xack(
             STREAM_NAME,
             GROUP_NAME,
@@ -58,16 +106,21 @@ def handle_job(message_id, job):
         print("Job ACKed:", message_id)
 
     except Exception as error:
+
+        # 4. Processing failed
         print("Job failed:", error)
 
-        current_attempt = int(job.get("attempt", "0"))
-
-        # Maximum number of total executions has been reached
+        current_attempt = int(
+            job.get("attempt", "0")
+        )
+        
+        # 5. Maximum attempts reached
         if current_attempt >= MAX_ATTEMPTS - 1:
+
             print("Maximum attempts reached.")
             print("Moving job to Dead Letter Queue.")
 
-            # Store the permanently failed job
+            # Store permanently failed job
             # in the Dead Letter Queue.
             redis_client.xadd(
                 DLQ_STREAM_NAME,
@@ -80,26 +133,36 @@ def handle_job(message_id, job):
                 }
             )
 
-            # The original message is no longer being processed,
-            # so remove it from the Pending Entries List.
+            # Remove the original message
+            # from the Pending Entries List.
             redis_client.xack(
                 STREAM_NAME,
                 GROUP_NAME,
                 message_id
             )
 
-            print("Job moved to DLQ:", job["job_id"])
+            print(
+                "Job moved to DLQ:",
+                job["job_id"]
+            )
+
             return
 
-        # Schedule the next attempt
+    
+        # 6. Schedule next retry
         next_attempt = current_attempt + 1
 
         # Exponential backoff:
+        #
         # attempt 1 -> 1 second
         # attempt 2 -> 2 seconds
         # attempt 3 -> 4 seconds
         # attempt 4 -> 8 seconds
-        retry_delay = BASE_RETRY_DELAY * (2 ** (next_attempt - 1))
+
+        retry_delay = (
+            BASE_RETRY_DELAY
+            * (2 ** (next_attempt - 1))
+        )
 
         retry_at = time.time() + retry_delay
 
@@ -110,15 +173,14 @@ def handle_job(message_id, job):
             "attempt": str(next_attempt)
         }
 
-        # The current execution is finished.
-        # ACK the current Redis Stream message.
+        # Current execution is finished.
         redis_client.xack(
             STREAM_NAME,
             GROUP_NAME,
             message_id
         )
 
-        # Put the next attempt into the retry Sorted Set.
+        # Put next attempt into retry Sorted Set.
         redis_client.zadd(
             RETRY_ZSET,
             {
@@ -126,9 +188,22 @@ def handle_job(message_id, job):
             }
         )
 
-        print("Retry scheduled:", next_attempt)
-        print("Retry delay:", retry_delay, "seconds")
-        print("Retry time:", retry_at)
+        print(
+            "Retry scheduled:",
+            next_attempt
+        )
+
+        print(
+            "Retry delay:",
+            retry_delay,
+            "seconds"
+        )
+
+        print(
+            "Retry time:",
+            retry_at
+        )
+
 
 def reclaim_pending_jobs():
     """
@@ -147,7 +222,9 @@ def reclaim_pending_jobs():
 
     return result
 
+
 def main():
+
     print("Cerberus worker started...")
     print(f"Listening to stream: {STREAM_NAME}")
     print(f"Consumer group: {GROUP_NAME}")
@@ -155,6 +232,7 @@ def main():
 
     while True:
 
+    
         # 1. Recover abandoned/pending jobs
         reclaimed = reclaim_pending_jobs()
 
@@ -164,19 +242,30 @@ def main():
         for message_id, job in messages:
 
             print("\n--- Reclaimed Pending Job ---")
-            print("Message ID:", message_id)
+
+            print(
+                "Message ID:",
+                message_id
+            )
+
             print(
                 "Previous job owner has been replaced by:",
                 CONSUMER_NAME
             )
 
-            handle_job(message_id, job)
+            handle_job(
+                message_id,
+                job
+            )
 
+    
         # 2. Read new jobs
         messages = redis_client.xreadgroup(
             groupname=GROUP_NAME,
             consumername=CONSUMER_NAME,
-            streams={STREAM_NAME: ">"},
+            streams={
+                STREAM_NAME: ">"
+            },
             count=1,
             block=5000
         )
@@ -184,7 +273,11 @@ def main():
         for stream_name, entries in messages:
 
             for message_id, job in entries:
-                handle_job(message_id, job)
+
+                handle_job(
+                    message_id,
+                    job
+                )
 
 if __name__ == "__main__":
     main()
