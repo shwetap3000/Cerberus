@@ -1,39 +1,42 @@
+from fastapi import FastAPI
 from uuid import uuid4
 import json
 
-from fastapi import FastAPI
-
 from app.models import JobRequest
 from app.redis_client import redis_client
+from app.postgres_client import create_job
 
-app = FastAPI(title="Cerberus")
-
-@app.get("/")
-def root():
-    return {"message": "Cerberus is running"}
+app = FastAPI()
 
 @app.post("/jobs")
-def create_job(job: JobRequest):
-    # 1. Generate a unique ID for the job
-    job_id = str(uuid4())
+def create_new_job(job: JobRequest):
 
-    # 2. Convert the Python dictionary into a JSON string
+    # Generate a unique ID for the job
+    job_id = uuid4()
+
+    # Store the job in PostgreSQL
+    create_job(
+        job_id,
+        job.type,
+        job.payload
+    )
+
+    # Convert payload to JSON string for Redis
     payload = json.dumps(job.payload)
 
-    # 3. Add the job to the Redis Stream
+    # Add job to Redis Stream
     stream_id = redis_client.xadd(
         "cerberus:jobs",
         {
-            "job_id": job_id,
+            "job_id": str(job_id),
             "type": job.type,
             "payload": payload,
             "attempt": "0"
         }
     )
 
-    # 4. Return information about the submitted job
     return {
-        "job_id": job_id,
+        "job_id": str(job_id),
         "stream_id": stream_id,
         "type": job.type,
         "payload": job.payload,
