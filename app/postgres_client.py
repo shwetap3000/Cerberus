@@ -43,14 +43,65 @@ def create_job(job_id, job_type, payload):
     finally:
         connection.close()
 
+def update_job_status(job_id, status, attempts=None):
+    connection = get_connection()
 
+    try:
+        with connection.cursor() as cursor:
+
+            if attempts is not None:
+                cursor.execute(
+                    """
+                    UPDATE jobs
+                    SET status = %s,
+                        attempts = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE job_id = %s
+                    """,
+                    (
+                        status,
+                        attempts,
+                        job_id
+                    )
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE jobs
+                    SET status = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE job_id = %s
+                    """,
+                    (
+                        status,
+                        job_id
+                    )
+                )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+# if __name__ == "__main__":
+#     test_job_id = uuid.uuid4()
+
+#     create_job(
+#         test_job_id,
+#         "test",
+#         {"message": "Hello from Cerberus"}
+#     )
+
+#     print("Test job inserted successfully")
+
+
+# temporary replacing (for testing postgresql before involving the worker)
 if __name__ == "__main__":
-    test_job_id = uuid.uuid4()
+    test_job_id = "e06034f2-7899-4d4f-9ab8-f833f049faeb"    # job_id from pgAdmin data output
 
-    create_job(
+    update_job_status(
         test_job_id,
-        "test",
-        {"message": "Hello from Cerberus"}
+        "processing"
     )
 
-    print("Test job inserted successfully")
+    print("Job status updated successfully")
