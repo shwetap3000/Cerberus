@@ -132,14 +132,15 @@ def handle_job(message_id, job):
     except Exception as error:
         print("Job failed:", error)
 
-        update_job_status(
-            job["job_id"],
-            "failed"
-        )
-
         current_attempt = int(
             job.get("attempt", "0")
         )
+        
+        update_job_status(
+                    job["job_id"],
+                    "failed",
+                    current_attempt
+                )
 
         # 7. Maximum attempts reached
         if current_attempt >= MAX_ATTEMPTS - 1:
