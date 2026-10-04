@@ -130,9 +130,12 @@ def handle_job(message_id, job):
         print("Job ACKed:", message_id)
 
     except Exception as error:
-
-        # 6. Processing failed
         print("Job failed:", error)
+
+        update_job_status(
+            job["job_id"],
+            "failed"
+        )
 
         current_attempt = int(
             job.get("attempt", "0")
