@@ -5,6 +5,7 @@ import time
 from app.redis_client import redis_client
 from app.postgres_client import update_job_status
 
+
 STREAM_NAME = "cerberus:jobs"
 GROUP_NAME = "cerberus-workers"
 
@@ -100,7 +101,18 @@ def handle_job(message_id, job):
         # 3. Process the job
         process_job(job)
 
-        # 4. Processing succeeded
+        # 4. Mark job as completed in PostgreSQL
+        update_job_status(
+            job["job_id"],
+            "completed"
+        )
+
+        print(
+            "Job marked as completed:",
+            job["job_id"]
+        )
+
+        # 5. Mark job as processed in Redis
         mark_job_processed(job["job_id"])
 
         print(
@@ -119,14 +131,14 @@ def handle_job(message_id, job):
 
     except Exception as error:
 
-        # 5. Processing failed
+        # 6. Processing failed
         print("Job failed:", error)
 
         current_attempt = int(
             job.get("attempt", "0")
         )
 
-        # 6. Maximum attempts reached
+        # 7. Maximum attempts reached
         if current_attempt >= MAX_ATTEMPTS - 1:
 
             print("Maximum attempts reached.")
@@ -160,7 +172,7 @@ def handle_job(message_id, job):
 
             return
 
-        # 7. Schedule next retry
+        # 8. Schedule next retry
         next_attempt = current_attempt + 1
 
         # Exponential backoff:
