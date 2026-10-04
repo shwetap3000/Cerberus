@@ -83,25 +83,13 @@ def update_job_status(job_id, status, attempts=None):
     finally:
         connection.close()
 
-# if __name__ == "__main__":
-#     test_job_id = uuid.uuid4()
-
-#     create_job(
-#         test_job_id,
-#         "test",
-#         {"message": "Hello from Cerberus"}
-#     )
-
-#     print("Test job inserted successfully")
-
-
-# temporary replacing (for testing postgresql before involving the worker)
 if __name__ == "__main__":
-    test_job_id = "e06034f2-7899-4d4f-9ab8-f833f049faeb"    # job_id from pgAdmin data output
+    test_job_id = uuid.uuid4()
 
-    update_job_status(
+    create_job(
         test_job_id,
-        "processing"
+        "test",
+        {"message": "Hello from Cerberus"}
     )
 
-    print("Job status updated successfully")
+    print("Test job inserted successfully")

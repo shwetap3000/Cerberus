@@ -3,6 +3,7 @@ import sys
 import time
 
 from app.redis_client import redis_client
+from app.postgres_client import update_job_status
 
 STREAM_NAME = "cerberus:jobs"
 GROUP_NAME = "cerberus-workers"
@@ -18,11 +19,13 @@ MAX_ATTEMPTS = 5
 # before another worker can reclaim it.
 MIN_IDLE_TIME = 5000
 
+
 if len(sys.argv) < 2:
     print("Usage: python -m app.worker <worker-name>")
     sys.exit(1)
 
 CONSUMER_NAME = sys.argv[1]
+
 
 def process_job(job):
     print("\n--- Processing Job ---")
@@ -38,6 +41,7 @@ def process_job(job):
 
     print("--- Job Completed ---\n")
 
+
 def check_idempotency(job_id):
     """
     Check whether this job has already been successfully processed.
@@ -46,6 +50,7 @@ def check_idempotency(job_id):
     key = f"{IDEMPOTENCY_PREFIX}{job_id}"
 
     return redis_client.exists(key) == 1
+
 
 def mark_job_processed(job_id):
     """
@@ -58,6 +63,7 @@ def mark_job_processed(job_id):
         key,
         "1"
     )
+
 
 def handle_job(message_id, job):
     """
@@ -85,10 +91,16 @@ def handle_job(message_id, job):
         return
 
     try:
-        # 2. Process the job
+        # 2. Mark job as processing in PostgreSQL
+        update_job_status(
+            job["job_id"],
+            "processing"
+        )
+
+        # 3. Process the job
         process_job(job)
 
-        # 3. Processing succeeded
+        # 4. Processing succeeded
         mark_job_processed(job["job_id"])
 
         print(
@@ -107,14 +119,14 @@ def handle_job(message_id, job):
 
     except Exception as error:
 
-        # 4. Processing failed
+        # 5. Processing failed
         print("Job failed:", error)
 
         current_attempt = int(
             job.get("attempt", "0")
         )
-        
-        # 5. Maximum attempts reached
+
+        # 6. Maximum attempts reached
         if current_attempt >= MAX_ATTEMPTS - 1:
 
             print("Maximum attempts reached.")
@@ -148,8 +160,7 @@ def handle_job(message_id, job):
 
             return
 
-    
-        # 6. Schedule next retry
+        # 7. Schedule next retry
         next_attempt = current_attempt + 1
 
         # Exponential backoff:
@@ -232,7 +243,6 @@ def main():
 
     while True:
 
-    
         # 1. Recover abandoned/pending jobs
         reclaimed = reclaim_pending_jobs()
 
@@ -258,7 +268,6 @@ def main():
                 job
             )
 
-    
         # 2. Read new jobs
         messages = redis_client.xreadgroup(
             groupname=GROUP_NAME,
@@ -278,6 +287,7 @@ def main():
                     message_id,
                     job
                 )
+
 
 if __name__ == "__main__":
     main()
