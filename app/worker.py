@@ -40,6 +40,14 @@ def process_job(job):
     if job["type"] == "fail":
         raise Exception("Intentional test failure")
 
+    # Fail only on the first attempt.
+    # Used to test the retry lifecycle.
+    if (
+        job["type"] == "fail_once"
+        and int(job.get("attempt", "0")) == 0
+    ):
+        raise Exception("Intentional first-attempt failure")
+
     print("--- Job Completed ---\n")
 
 
@@ -92,19 +100,37 @@ def handle_job(message_id, job):
         return
 
     try:
-        # 2. Mark job as processing in PostgreSQL
-        update_job_status(
-            job["job_id"],
-            "processing"
+        # 2. Get the current attempt number
+        current_attempt = int(
+            job.get("attempt", "0")
         )
 
-        # 3. Process the job
-        process_job(job)
-
-        # 4. Mark job as completed in PostgreSQL
+        # 3. Mark job as processing in PostgreSQL
+        #    and store the current attempt number.
         update_job_status(
             job["job_id"],
-            "completed"
+            "processing",
+            current_attempt
+        )
+
+        print(
+            "Job marked as processing:",
+            job["job_id"]
+        )
+
+        print(
+            "Current attempt:",
+            current_attempt
+        )
+
+        # 4. Process the job
+        process_job(job)
+
+        # 5. Mark job as completed in PostgreSQL
+        update_job_status(
+            job["job_id"],
+            "completed",
+            current_attempt
         )
 
         print(
@@ -112,8 +138,10 @@ def handle_job(message_id, job):
             job["job_id"]
         )
 
-        # 5. Mark job as processed in Redis
-        mark_job_processed(job["job_id"])
+        # 6. Mark job as processed in Redis
+        mark_job_processed(
+            job["job_id"]
+        )
 
         print(
             "Job marked as processed:",
@@ -127,26 +155,43 @@ def handle_job(message_id, job):
             message_id
         )
 
-        print("Job ACKed:", message_id)
+        print(
+            "Job ACKed:",
+            message_id
+        )
 
     except Exception as error:
-        print("Job failed:", error)
 
+        print(
+            "Job failed:",
+            error
+        )
+
+        # Make sure current_attempt exists
+        # even if the failure happened before
+        # attempt initialization.
         current_attempt = int(
             job.get("attempt", "0")
         )
-        
+
+        # Mark the current attempt as failed
+        # in PostgreSQL.
         update_job_status(
-                    job["job_id"],
-                    "failed",
-                    current_attempt
-                )
+            job["job_id"],
+            "failed",
+            current_attempt
+        )
 
         # 7. Maximum attempts reached
         if current_attempt >= MAX_ATTEMPTS - 1:
 
-            print("Maximum attempts reached.")
-            print("Moving job to Dead Letter Queue.")
+            print(
+                "Maximum attempts reached."
+            )
+
+            print(
+                "Moving job to Dead Letter Queue."
+            )
 
             # Store permanently failed job
             # in the Dead Letter Queue.
@@ -191,7 +236,10 @@ def handle_job(message_id, job):
             * (2 ** (next_attempt - 1))
         )
 
-        retry_at = time.time() + retry_delay
+        retry_at = (
+            time.time()
+            + retry_delay
+        )
 
         retry_job = {
             "job_id": job["job_id"],
@@ -252,10 +300,21 @@ def reclaim_pending_jobs():
 
 def main():
 
-    print("Cerberus worker started...")
-    print(f"Listening to stream: {STREAM_NAME}")
-    print(f"Consumer group: {GROUP_NAME}")
-    print(f"Consumer name: {CONSUMER_NAME}")
+    print(
+        "Cerberus worker started..."
+    )
+
+    print(
+        f"Listening to stream: {STREAM_NAME}"
+    )
+
+    print(
+        f"Consumer group: {GROUP_NAME}"
+    )
+
+    print(
+        f"Consumer name: {CONSUMER_NAME}"
+    )
 
     while True:
 
@@ -267,7 +326,9 @@ def main():
 
         for message_id, job in messages:
 
-            print("\n--- Reclaimed Pending Job ---")
+            print(
+                "\n--- Reclaimed Pending Job ---"
+            )
 
             print(
                 "Message ID:",
