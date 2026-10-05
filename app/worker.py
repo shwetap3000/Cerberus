@@ -192,6 +192,14 @@ def handle_job(message_id, job):
             print(
                 "Moving job to Dead Letter Queue."
             )
+            
+            # Mark job as permanently failed
+            # in PostgreSQL.
+            update_job_status(
+                job["job_id"],
+                "dead_letter",
+                current_attempt
+            )
 
             # Store permanently failed job
             # in the Dead Letter Queue.
