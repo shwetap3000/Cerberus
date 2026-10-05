@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+import random
 
 from app.redis_client import redis_client
 from app.postgres_client import update_job_status
@@ -15,6 +16,9 @@ IDEMPOTENCY_PREFIX = "cerberus:processed:"
 
 BASE_RETRY_DELAY = 1
 MAX_ATTEMPTS = 5
+
+# Maximum random variation added to retry delay
+JITTER = 0.5
 
 # For now, a pending job must be idle for at least 5 seconds
 # before another worker can reclaim it.
@@ -238,11 +242,18 @@ def handle_job(message_id, job):
         # attempt 2 -> 2 seconds
         # attempt 3 -> 4 seconds
         # attempt 4 -> 8 seconds
-
-        retry_delay = (
+        
+        base_delay = (
             BASE_RETRY_DELAY
             * (2 ** (next_attempt - 1))
         )
+
+        jitter = random.uniform(
+            0,
+            JITTER
+        )
+
+        retry_delay = base_delay + jitter
 
         retry_at = (
             time.time()
@@ -285,6 +296,24 @@ def handle_job(message_id, job):
         print(
             "Retry time:",
             retry_at
+        )
+        
+        print(
+            "Base retry delay:",
+            base_delay,
+            "seconds"
+        )
+
+        print(
+            "Jitter:",
+            jitter,
+            "seconds"
+        )
+
+        print(
+            "Final retry delay:",
+            retry_delay,
+            "seconds"
         )
 
 
