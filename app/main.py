@@ -1,10 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from uuid import uuid4
 import json
 
 from app.models import JobRequest
 from app.redis_client import redis_client
 from app.postgres_client import create_job
+from app.metrics import jobs_submitted
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
 
@@ -34,6 +36,8 @@ def create_new_job(job: JobRequest):
             "attempt": "0"
         }
     )
+    
+    jobs_submitted.inc()
 
     return {
         "job_id": str(job_id),
@@ -42,3 +46,10 @@ def create_new_job(job: JobRequest):
         "payload": job.payload,
         "status": "queued"
     }
+    
+@app.get("/metrics")
+def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )

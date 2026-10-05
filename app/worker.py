@@ -6,6 +6,12 @@ import random
 from app.redis_client import redis_client
 from app.postgres_client import update_job_status
 
+from app.metrics import (
+    jobs_completed,
+    jobs_failed,
+    jobs_retried,
+    jobs_dead_lettered
+)
 
 STREAM_NAME = "cerberus:jobs"
 GROUP_NAME = "cerberus-workers"
@@ -129,6 +135,8 @@ def handle_job(message_id, job):
 
         # 4. Process the job
         process_job(job)
+        
+        jobs_completed.inc()
 
         # 5. Mark job as completed in PostgreSQL
         update_job_status(
@@ -170,6 +178,8 @@ def handle_job(message_id, job):
             "Job failed:",
             error
         )
+        
+        jobs_failed.inc()
 
         # Make sure current_attempt exists
         # even if the failure happened before
@@ -217,6 +227,8 @@ def handle_job(message_id, job):
                     "reason": "maximum_attempts_exceeded"
                 }
             )
+            
+            jobs_dead_lettered.inc()
 
             # Remove the original message
             # from the Pending Entries List.
@@ -281,6 +293,8 @@ def handle_job(message_id, job):
                 json.dumps(retry_job): retry_at
             }
         )
+        
+        jobs_retried.inc()
 
         print(
             "Retry scheduled:",
