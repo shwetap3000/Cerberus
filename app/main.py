@@ -6,7 +6,12 @@ from app.models import JobRequest
 from app.redis_client import redis_client
 from app.postgres_client import create_job
 from app.metrics import jobs_submitted
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import (
+    CollectorRegistry,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+    multiprocess
+)
 
 app = FastAPI()
 
@@ -49,7 +54,13 @@ def create_new_job(job: JobRequest):
     
 @app.get("/metrics")
 def metrics():
+    registry = CollectorRegistry()
+
+    multiprocess.MultiProcessCollector(
+        registry
+    )
+
     return Response(
-        content=generate_latest(),
+        content=generate_latest(registry),
         media_type=CONTENT_TYPE_LATEST
     )
