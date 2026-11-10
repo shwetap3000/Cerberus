@@ -1,0 +1,40 @@
+
+services:
+  api:
+    build: .
+    container_name: cerberus-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: cerberus-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    container_name: cerberus-postgres
+    environment:
+      POSTGRES_DB: cerberus
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  postgres_data:
