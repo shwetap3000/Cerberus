@@ -5,6 +5,7 @@ import random
 
 from app.redis_client import redis_client
 from app.postgres_client import update_job_status
+from redis.exceptions import ResponseError
 
 from app.metrics import (
     jobs_completed,
@@ -30,6 +31,23 @@ JITTER = 0.5
 # before another worker can reclaim it.
 MIN_IDLE_TIME = 5000
 
+def initialize_consumer_group():
+    try:
+        redis_client.xgroup_create(
+            name=STREAM_NAME,
+            groupname=GROUP_NAME,
+            id="0",
+            mkstream=True
+        )
+
+        print("Consumer Group created successfully.")
+
+    except ResponseError as error:
+        if "BUSYGROUP" in str(error):
+            print("Consumer Group already exists.")
+        else:
+            raise
+
 
 if len(sys.argv) < 2:
     print("Usage: python -m app.worker <worker-name>")
@@ -45,6 +63,10 @@ def process_job(job):
 
     payload = json.loads(job["payload"])
     print("Payload:", payload)
+    
+    # slow job (use for worker crash)
+    if job["type"] == "slow":
+        time.sleep(30)
 
     # Temporary failure test
     if job["type"] == "fail":
@@ -331,7 +353,7 @@ def handle_job(message_id, job):
         )
 
 
-def reclaim_pending_jobs():
+def reclaim_pending_jobs(start_id="0-0"):
     """
     Find pending jobs that have been idle long enough
     and transfer their ownership to this worker.
@@ -342,7 +364,7 @@ def reclaim_pending_jobs():
         groupname=GROUP_NAME,
         consumername=CONSUMER_NAME,
         min_idle_time=MIN_IDLE_TIME,
-        start_id="0-0",
+        start_id=start_id,
         count=10
     )
 
@@ -350,6 +372,12 @@ def reclaim_pending_jobs():
 
 
 def main():
+    
+    initialize_consumer_group()
+    next_start_id = "0-0"
+    
+    if next_start_id == "0-0":
+        next_start_id = "0-0"
 
     print(
         "Cerberus worker started..."
@@ -370,7 +398,7 @@ def main():
     while True:
 
         # 1. Recover abandoned/pending jobs
-        reclaimed = reclaim_pending_jobs()
+        reclaimed = reclaim_pending_jobs(next_start_id)
 
         next_start_id = reclaimed[0]
         messages = reclaimed[1]
