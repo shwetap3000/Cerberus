@@ -4,17 +4,30 @@ import uuid
 import psycopg
 from dotenv import load_dotenv
 from psycopg.types.json import Jsonb
+from urllib.parse import urlsplit, urlunsplit
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+
 
 
 def get_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
+    
+    parts = urlsplit(DATABASE_URL)
 
-    return psycopg.connect(DATABASE_URL)
+    docker_database_url = urlunsplit((
+        parts.scheme,
+        f"{parts.username}:{parts.password}@{DB_HOST}:{parts.port}",
+        parts.path,
+        parts.query,
+        parts.fragment
+    ))
+
+    return psycopg.connect(docker_database_url)
 
 
 def create_job(job_id, job_type, payload):
