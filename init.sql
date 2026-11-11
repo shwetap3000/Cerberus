@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id UUID PRIMARY KEY,
+    job_type VARCHAR(100),
+    payload JSONB,
+    status VARCHAR(20) DEFAULT 'queued',
+    attempts INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

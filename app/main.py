@@ -27,6 +27,8 @@ def create_new_job(job: JobRequest):
         job.type,
         job.payload
     )
+    
+    print(f"PostgreSQL insert successful for job: {job_id}")
 
     # Convert payload to JSON string for Redis
     payload = json.dumps(job.payload)

@@ -8,6 +8,32 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:  
+      DB_HOST: postgres
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m app.worker worker-1
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  retry-scheduler:
+    build: .
+    command: python -m app.retry_scheduler
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
     depends_on:
       - redis
       - postgres
@@ -15,7 +41,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: cerberus-redis
     ports:
       - "6379:6379"
     volumes:
@@ -33,6 +58,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     restart: unless-stopped
 
 volumes:
