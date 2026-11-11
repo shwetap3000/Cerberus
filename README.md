@@ -1,1936 +1,372 @@
-# Cerberus
+# Cerberus: Fault-Tolerant Distributed Job Execution System
 
-> A fault-tolerant distributed job execution system built with Python, FastAPI, Redis Streams, PostgreSQL, and Prometheus.
+Cerberus is a background job execution system built from scratch with **Python, FastAPI, Redis Streams, PostgreSQL and Prometheus**. It was built to understand how reliable job-processing systems work internally, so queueing, retries, backoff, crash recovery, idempotency and dead-lettering are implemented directly instead of relying on Celery or BullMQ.
 
-Cerberus is a distributed background job execution system designed to reliably process asynchronous jobs even when individual workers fail.
-
-The project focuses on practical distributed-systems concepts such as:
-
-- Reliable job delivery
-- Worker failure recovery
-- Redis Streams and Consumer Groups
-- Automatic job retries
-- Exponential backoff with jitter
-- Idempotent job processing
-- Dead Letter Queues
-- Durable job state using PostgreSQL
-- Multi-worker execution
-- Prometheus-based observability
-
-The primary goal of Cerberus is to understand and implement the core reliability mechanisms behind distributed job-processing systems without relying on frameworks such as Celery or BullMQ.
-
----
+Jobs are submitted over a REST API, tracked durably in PostgreSQL, and distributed to multiple workers through Redis Streams consumer groups. If a worker crashes, its unacknowledged jobs are reclaimed by another worker. Failed jobs are retried with exponential backoff and jitter, and jobs that keep failing are moved to a Dead Letter Queue.
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Problem Statement](#problem-statement)
-- [Goals](#goals)
+- [Key Features](#key-features)
 - [Architecture](#architecture)
-- [System Workflow](#system-workflow)
-- [Core Components](#core-components)
+- [How Job Processing Works](#how-job-processing-works)
 - [Job Lifecycle](#job-lifecycle)
-- [Worker Failure Recovery](#worker-failure-recovery)
-- [Retry Mechanism](#retry-mechanism)
-- [Exponential Backoff and Jitter](#exponential-backoff-and-jitter)
-- [Maximum Attempts](#maximum-attempts)
-- [Idempotency](#idempotency)
-- [Dead Letter Queue](#dead-letter-queue)
-- [PostgreSQL and Durable State](#postgresql-and-durable-state)
-- [Prometheus Monitoring](#prometheus-monitoring)
-- [Project Structure](#project-structure)
+- [Reliability Mechanisms](#reliability-mechanisms)
+- [Redis Data Structures](#redis-data-structures)
 - [Technology Stack](#technology-stack)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Running the System](#running-the-system)
-- [API Documentation](#api-documentation)
-- [Testing Failure Scenarios](#testing-failure-scenarios)
-- [Example Job](#example-job)
+- [Repository Structure](#repository-structure)
+- [Getting Started (Docker Compose)](#getting-started-docker-compose)
+- [Running Without Docker](#running-without-docker)
+- [Submitting Jobs](#submitting-jobs)
+- [Demonstrating Failure Scenarios](#demonstrating-failure-scenarios)
+- [Prometheus Metrics](#prometheus-metrics)
+- [Running Tests](#running-tests)
 - [Design Decisions](#design-decisions)
-- [Current Limitations](#current-limitations)
+- [Known Limitations](#known-limitations)
 - [Future Improvements](#future-improvements)
 - [Learning Outcomes](#learning-outcomes)
-- [Conclusion](#conclusion)
 
----
+## Key Features
 
-# Overview
+- **REST API**: submit jobs with `POST /jobs` (FastAPI, with request validation and Swagger docs).
+- **Redis Streams + consumer groups**: multiple independent workers share one queue.
+- **Acknowledgements**: workers `XACK` a message only after processing finishes.
+- **Crash recovery**: messages left pending by a dead worker are reclaimed with `XAUTOCLAIM` after an idle timeout.
+- **Automatic retries**: failed jobs are scheduled in a Redis Sorted Set and re-queued by a retry scheduler when due.
+- **Exponential backoff with jitter**: spreads retries out and avoids synchronized retry bursts.
+- **Dead Letter Queue**: jobs that exhaust 5 attempts are moved to `cerberus:dlq` for inspection.
+- **Idempotency checks**: `cerberus:processed:<job_id>` keys guard against re-processing redelivered jobs.
+- **Durable job state**: PostgreSQL stores status, attempt count and timestamps for every job.
+- **Observability**: Prometheus counters for submitted, completed, failed, retried and dead-lettered jobs at `/metrics`.
+- **Containerized**: Docker Compose runs the API, worker, retry scheduler, Redis and PostgreSQL.
 
-Cerberus accepts jobs through a REST API and places them into a Redis Stream.
-
-Workers consume jobs from the stream using Redis Consumer Groups.
-
-If a worker successfully processes a job, the job is acknowledged.
-
-If a worker crashes while processing a job, the job remains in the Redis Consumer Group's pending entries and can later be reclaimed by another worker using `XAUTOCLAIM`.
-
-If a job fails during processing, Cerberus automatically schedules a retry using exponential backoff with jitter.
-
-Jobs that continue failing beyond the maximum number of attempts are moved to a Dead Letter Queue (DLQ).
-
-PostgreSQL maintains the durable state of each job, while Redis is responsible for job execution and coordination.
-
-Prometheus provides application-level metrics for monitoring the system.
-
----
-
-# Problem Statement
-
-Traditional background-job systems need to handle more than simply executing a function.
-
-A reliable job execution system must answer questions such as:
-
-- What happens if a worker crashes?
-- What happens if a job fails temporarily?
-- How many times should a job be retried?
-- How should retries be delayed?
-- What happens when a job keeps failing?
-- How can duplicate processing be prevented?
-- How can job state survive application restarts?
-- How can the system be monitored?
-
-Cerberus was designed to explore and implement solutions to these problems.
-
----
-
-# Goals
-
-The main goals of Cerberus are:
-
-1. Reliable asynchronous job execution
-2. Worker failure recovery
-3. Automatic retries
-4. Exponential retry backoff
-5. Retry jitter
-6. Idempotent job processing
-7. Dead Letter Queue support
-8. Durable job state
-9. Multiple worker support
-10. Application observability
-
-The project intentionally avoids unnecessary complexity and focuses on the core reliability mechanisms of a distributed job execution system.
-
----
-
-# Architecture
-
-![architecture](image.png)
-
-The high-level architecture is:
+## Architecture
 
 ```text
                          Client
                            |
-                           | POST /jobs
                            v
-                    +--------------+
-                    |   FastAPI    |
-                    |     API      |
-                    +------+-------+
+                    FastAPI REST API
+                      POST /jobs
                            |
-             +-------------+-------------+
-             |                           |
-             v                           v
-       PostgreSQL                    Redis Stream
-       Job State                    cerberus:jobs
-                                         |
-                                  +------+------+
-                                  |             |
-                                  v             v
-                              Worker 1      Worker 2
-                                  |             |
-                                  +------+------+
-                                         |
-                                  Job Processing
-                                         |
-                           +-------------+-------------+
-                           |                           |
-                       Success                     Failure
-                           |                           |
-                           v                           v
-                         ACK                    Retry / DLQ
-                                                       |
-                                                       v
-                                               Retry Scheduler
-                                                       |
-                                                       v
-                                                Redis Retry ZSET
-````
+                 +---------+---------+
+                 |                   |
+                 v                   v
+             PostgreSQL         Redis Stream
+             Job records        cerberus:jobs
+                                     |
+                              Consumer Group
+                              cerberus-workers
+                                     |
+                       +-------------+-------------+
+                       |             |             |
+                       v             v             v
+                    Worker 1      Worker 2      Worker N
+                       |             |             |
+                       +-------------+-------------+
+                                     |
+                         +-----------+-----------+
+                         |                       |
+                         v                       v
+                     Completed                Failed
+                         |                       |
+                        XACK              Retry scheduling
+                                                 |
+                                                 v
+                                      Redis Sorted Set
+                                       cerberus:retries
+                                                 |
+                                          Retry Scheduler
+                                                 |
+                                                 +----> Redis Stream
 
----
+                         Permanently failing jobs
+                                     |
+                                     v
+                              Redis Stream
+                               cerberus:dlq
 
-# System Workflow
+                 Prometheus metrics are exposed at /metrics
+```
 
-A normal job follows this lifecycle:
+**Division of responsibility:** Redis handles execution and coordination (queueing, delivery, retries). PostgreSQL is the durable record of each job's state.
+
+## How Job Processing Works
+
+1. A client sends a job to `POST /jobs`.
+2. FastAPI validates the request and generates a unique job ID.
+3. The API stores the job record in PostgreSQL.
+4. The API adds the job to the `cerberus:jobs` Redis Stream.
+5. A worker in the `cerberus-workers` consumer group reads and processes the job.
+6. On success, the job is marked `completed` and acknowledged with `XACK`.
+7. On failure, the worker schedules a retry in `cerberus:retries`, subject to the maximum-attempt limit.
+8. The retry scheduler finds due entries and adds them back to the main stream.
+9. A job that reaches the maximum number of attempts is moved to `cerberus:dlq`.
+10. If a worker leaves a message pending, another worker reclaims it with `XAUTOCLAIM` after the configured idle period.
+
+## Job Lifecycle
 
 ```text
-Client
-  |
-  v
-POST /jobs
-  |
-  v
-FastAPI
-  |
-  +----> PostgreSQL
-  |       Store job
-  |
-  +----> Redis Stream
-          |
-          v
-       Worker
-          |
-          v
-     Process Job
-          |
-          v
-       Success
-          |
-          +----> PostgreSQL = completed
-          |
-          +----> Redis XACK
+Success:            queued -> processing -> completed
+
+Transient failure:  queued -> processing -> failed -> retry scheduled
+                          -> processing -> completed
+
+Permanent failure:  queued -> processing -> failed -> retry -> ... -> dead_letter
 ```
 
-For a failed job:
+## Reliability Mechanisms
 
-```text
-Worker
-   |
-   v
-Processing
-   |
-   v
-Failure
-   |
-   v
-PostgreSQL = failed
-   |
-   v
-Retry scheduled
-   |
-   v
-Redis Retry ZSET
-   |
-   v
-Retry Scheduler
-   |
-   v
-Redis Stream
-   |
-   v
-Worker
-```
+### Worker crash recovery
+If a worker dies mid-job, it never sends `XACK`, so Redis keeps the message in the consumer group's Pending Entries List. Another worker detects messages that have been idle too long and takes ownership with `XAUTOCLAIM`, so the job is not lost.
 
-If the job continues failing:
+### Retries, backoff and jitter
+Failed jobs go into the `cerberus:retries` sorted set, scored by the time they become eligible. The retry scheduler polls this set and re-queues due jobs. Delays grow exponentially with each attempt, and a random jitter is added so many failing jobs do not all retry at the same instant.
 
-```text
-Failure
-   |
-   v
-Retry
-   |
-   v
-Retry
-   |
-   v
-...
-   |
-   v
-Maximum Attempts Reached
-   |
-   v
-Dead Letter Queue
-```
+### Maximum attempts and DLQ
+A job is attempted at most **5 times**. After that, PostgreSQL is updated to `dead_letter`, the job is written to `cerberus:dlq`, the original message is acknowledged, and the dead-letter metric is incremented. This stops permanently failing jobs from retrying forever.
 
----
+### Idempotency
+Before processing, a worker checks `cerberus:processed:<job_id>`. If the key exists (for example, the job succeeded but the worker crashed before `XACK`), the job is acknowledged without being executed again.
 
-# Core Components
+> **Delivery guarantee:** Cerberus provides **at-least-once** delivery with idempotency checks to reduce duplicate execution. It does **not** claim exactly-once execution. See [Known Limitations](#known-limitations).
 
-## 1. FastAPI
+## Redis Data Structures
 
-FastAPI provides the HTTP API used to submit jobs.
+| Redis Key | Type | Purpose |
+|---|---|---|
+| `cerberus:jobs` | Stream | Main job queue |
+| `cerberus:retries` | Sorted Set | Jobs waiting for their retry time |
+| `cerberus:dlq` | Stream | Jobs that exceeded the retry limit |
+| `cerberus:processed:<job_id>` | Key | Idempotency tracking |
+| `cerberus-workers` | Consumer Group | Coordinates workers on the main stream |
 
-The main endpoint is:
+## Technology Stack
 
-```text
-POST /jobs
-```
+| Technology | Role |
+|---|---|
+| Python | Application and worker implementation |
+| FastAPI | REST API and request validation |
+| Redis Streams | Main job queue and consumer groups |
+| Redis Sorted Sets | Scheduled retry queue |
+| PostgreSQL | Persistent job records and status |
+| Prometheus Client | Application metrics |
+| Docker Compose | Local multi-service environment |
+| pytest | Automated testing |
 
-The API:
-
-1. Generates a unique job ID.
-2. Stores the job in PostgreSQL.
-3. Adds the job to the Redis Stream.
-4. Returns the job ID and stream ID.
-
-FastAPI also exposes the Prometheus metrics endpoint:
-
-```text
-GET /metrics
-```
-
----
-
-## 2. Redis Streams
-
-Redis Streams are used as the job transport mechanism.
-
-The main stream is:
-
-```text
-cerberus:jobs
-```
-
-A stream entry contains information such as:
-
-```text
-job_id
-type
-payload
-attempt
-```
-
-Redis Streams provide persistent stream entries and support consumer groups, making them suitable for coordinating multiple workers.
-
----
-
-## 3. Redis Consumer Groups
-
-Workers operate as members of the Redis Consumer Group:
-
-```text
-cerberus-workers
-```
-
-Example:
-
-```text
-cerberus-workers
-    |
-    +-- worker-1
-    |
-    +-- worker-2
-    |
-    +-- worker-3
-```
-
-The consumer group allows multiple workers to consume jobs from the same stream.
-
-Each worker has its own consumer name.
-
-Example:
-
-```bash
-python -m app.worker worker-1
-```
-
-Another worker can be started with:
-
-```bash
-python -m app.worker worker-2
-```
-
----
-
-## 4. Job Acknowledgement
-
-After successfully processing a job, the worker acknowledges the Redis Stream entry using `XACK`.
-
-Conceptually:
-
-```text
-Job received
-     |
-     v
-Process job
-     |
-     v
-Success
-     |
-     v
-XACK
-```
-
-Acknowledgement tells Redis that the worker has successfully handled the stream entry.
-
-If the worker crashes before acknowledging the job, the job remains pending.
-
----
-
-# Job Lifecycle
-
-A successful job follows:
-
-```text
-queued
-   |
-   v
-processing
-   |
-   v
-completed
-```
-
-A temporarily failing job follows:
-
-```text
-queued
-   |
-   v
-processing
-   |
-   v
-failed
-   |
-   v
-retry scheduled
-   |
-   v
-processing
-   |
-   v
-completed
-```
-
-A permanently failing job follows:
-
-```text
-queued
-   |
-   v
-processing
-   |
-   v
-failed
-   |
-   v
-retry
-   |
-   v
-failed
-   |
-   v
-...
-   |
-   v
-dead_letter
-```
-
----
-
-# Worker Failure Recovery
-
-One of the most important features of Cerberus is worker crash recovery.
-
-Consider:
-
-```text
-Worker 1
-   |
-   v
-Receives Job A
-   |
-   v
-Starts processing
-   |
-   X
-Worker crashes
-```
-
-Because the worker did not acknowledge the job, Redis keeps the entry in the Pending Entries List.
-
-Another worker can identify sufficiently idle pending jobs and reclaim them using:
-
-```text
-XAUTOCLAIM
-```
-
-The recovery flow becomes:
-
-```text
-Worker 1
-   |
-   X
-Crash
-   |
-   v
-Pending Job
-   |
-   v
-XAUTOCLAIM
-   |
-   v
-Worker 2
-   |
-   v
-Process Job
-```
-
-This prevents a worker crash from permanently losing the job.
-
----
-
-# Retry Mechanism
-
-A job can fail even when the worker itself is healthy.
-
-For example:
-
-* Temporary database failure
-* Temporary network failure
-* External service failure
-* Application-level failure
-
-Cerberus therefore supports automatic retries.
-
-When a job fails:
-
-1. The failure is recorded.
-2. The attempt count is updated.
-3. The job is scheduled for retry.
-4. The retry scheduler waits until the retry time.
-5. The job is added back to the Redis Stream.
-6. Another worker can process the job again.
-
----
-
-# Retry Sorted Set
-
-Retries are stored in a Redis Sorted Set:
-
-```text
-cerberus:retries
-```
-
-The score represents the time at which the job should become eligible for retry.
-
-Conceptually:
-
-```text
-cerberus:retries
-
-job-A    → retry at 10:00:05
-job-B    → retry at 10:00:10
-job-C    → retry at 10:00:15
-```
-
-The retry scheduler periodically checks this sorted set and moves jobs whose retry time has arrived back into the main Redis Stream.
-
----
-
-# Exponential Backoff and Jitter
-
-Cerberus uses exponential backoff for retries.
-
-Instead of retrying immediately after every failure, the delay increases with each attempt.
-
-Conceptually:
-
-```text
-Attempt 1 → short delay
-Attempt 2 → longer delay
-Attempt 3 → even longer delay
-Attempt 4 → longer again
-```
-
-A typical exponential backoff strategy can be represented as:
-
-```text
-delay = base_delay × 2^attempt
-```
-
-Cerberus also adds jitter.
-
-Jitter introduces a small random variation to the retry delay.
-
-This helps avoid multiple jobs retrying at exactly the same time.
-
-Conceptually:
-
-```text
-Without jitter:
-
-Job A ───── retry at 10:00:10
-Job B ───── retry at 10:00:10
-Job C ───── retry at 10:00:10
-
-
-With jitter:
-
-Job A ───── retry at 10:00:09.8
-Job B ───── retry at 10:00:10.2
-Job C ───── retry at 10:00:10.5
-```
-
-This reduces synchronized retry bursts.
-
----
-
-# Maximum Attempts
-
-Cerberus limits the number of attempts for a job.
-
-The current maximum is:
-
-```text
-MAX_ATTEMPTS = 5
-```
-
-Once the maximum number of attempts is reached, the system stops retrying the job.
-
-The job is instead moved to the Dead Letter Queue.
-
----
-
-# Idempotency
-
-Distributed systems can sometimes process the same job more than once.
-
-For example:
-
-```text
-Worker receives job
-       |
-       v
-Job processing succeeds
-       |
-       X
-Worker crashes before ACK
-       |
-       v
-Another worker receives the same job
-```
-
-Without idempotency, the operation could potentially execute twice.
-
-Cerberus uses an idempotency key based on the job ID.
-
-The key format is:
-
-```text
-cerberus:processed:<job_id>
-```
-
-Before processing a job, the worker checks whether it has already been processed.
-
-Conceptually:
-
-```text
-              Job
-               |
-               v
-       Already processed?
-          /          \
-        YES           NO
-        |              |
-        v              v
-      ACK           Process
-                       |
-                       v
-                 Mark processed
-                       |
-                       v
-                      ACK
-```
-
-This provides protection against duplicate processing in scenarios where a job can be delivered again.
-
----
-
-# Dead Letter Queue
-
-Some jobs may continue failing despite retries.
-
-Retrying such jobs forever is undesirable.
-
-Cerberus therefore provides a Dead Letter Queue.
-
-The DLQ stream is:
-
-```text
-cerberus:dlq
-```
-
-The lifecycle is:
-
-```text
-Job
- |
- v
-Attempt 1
- |
-Failure
- |
- v
-Retry
- |
- v
-Attempt 2
- |
-Failure
- |
- v
-Retry
- |
- v
-...
- |
- v
-Maximum Attempts Reached
- |
-Failure
- |
- v
-DLQ
-```
-
-When a job is moved to the DLQ:
-
-* PostgreSQL is updated to `dead_letter`
-* The job is added to the DLQ Redis Stream
-* The job is acknowledged from the original stream
-* The DLQ metric is incremented
-
-This prevents endlessly retrying permanently failing jobs.
-
----
-
-# PostgreSQL and Durable State
-
-Redis is responsible for job execution and coordination.
-
-PostgreSQL is used for the durable state of each job.
-
-The `jobs` table stores information such as:
-
-```text
-job_id
-job_type
-payload
-status
-attempts
-created_at
-updated_at
-```
-
-Example lifecycle:
-
-```text
-queued
-   ↓
-processing
-   ↓
-completed
-```
-
-For failures:
-
-```text
-queued
-   ↓
-processing
-   ↓
-failed
-   ↓
-retry
-   ↓
-processing
-   ↓
-completed
-```
-
-For permanently failing jobs:
-
-```text
-queued
-   ↓
-processing
-   ↓
-failed
-   ↓
-retry
-   ↓
-...
-   ↓
-dead_letter
-```
-
-This separation gives Cerberus two distinct responsibilities:
-
-```text
-Redis
-→ Job execution and coordination
-
-PostgreSQL
-→ Durable job state
-```
-
----
-
-# Prometheus Monitoring
-
-Cerberus exposes application metrics through:
-
-```text
-GET /metrics
-```
-
-The metrics are generated using the Prometheus Python client.
-
-The following application metrics are currently tracked:
-
-| Metric                              | Description                       |
-| ----------------------------------- | --------------------------------- |
-| `cerberus_jobs_submitted_total`     | Total jobs successfully submitted |
-| `cerberus_jobs_completed_total`     | Total jobs completed successfully |
-| `cerberus_jobs_failed_total`        | Total job processing failures     |
-| `cerberus_jobs_retried_total`       | Total retries scheduled           |
-| `cerberus_jobs_dead_lettered_total` | Total jobs moved to DLQ           |
-
-Example:
-
-```text
-cerberus_jobs_submitted_total 4.0
-cerberus_jobs_completed_total 3.0
-cerberus_jobs_failed_total 11.0
-cerberus_jobs_retried_total 9.0
-cerberus_jobs_dead_lettered_total 2.0
-```
-
-These metrics make it possible to observe the behavior of the job-processing system.
-
----
-
-# Multi-Process Prometheus Metrics
-
-FastAPI and workers run as separate Python processes.
-
-A normal in-memory Prometheus counter belongs to the process that created it.
-
-Therefore, Cerberus uses the Prometheus Python client's multiprocess mode.
-
-The environment variable:
-
-```text
-PROMETHEUS_MULTIPROC_DIR
-```
-
-points to the directory used to share metric data between processes.
-
-The `/metrics` endpoint uses a dedicated `CollectorRegistry` together with `MultiProcessCollector`.
-
-This allows metrics generated by the API and worker processes to be combined when `/metrics` is requested.
-
-The architecture is:
-
-```text
-FastAPI Process
-    |
-    +── jobs_submitted
-
-Worker Process
-    |
-    +── jobs_completed
-    +── jobs_failed
-    +── jobs_retried
-    +── jobs_dead_lettered
-
-             |
-             v
-   PROMETHEUS_MULTIPROC_DIR
-             |
-             v
-        /metrics
-             |
-             v
-      Combined Metrics
-```
-
-This was tested successfully using separate FastAPI and worker processes.
-
----
-
-# Redis Keys and Streams
-
-Cerberus uses the following Redis structures:
-
-| Redis Key                     | Type           | Purpose                  |
-| ----------------------------- | -------------- | ------------------------ |
-| `cerberus:jobs`               | Stream         | Main job queue           |
-| `cerberus:retries`            | Sorted Set     | Stores scheduled retries |
-| `cerberus:dlq`                | Stream         | Dead Letter Queue        |
-| `cerberus:processed:<job_id>` | Key            | Idempotency tracking     |
-| `cerberus-workers`            | Consumer Group | Worker coordination      |
-
----
-
-# Technology Stack
-
-| Technology        | Purpose                                                    |
-| ----------------- | ---------------------------------------------------------- |
-| Python            | Core application and worker implementation                 |
-| FastAPI           | REST API                                                   |
-| Redis             | Job queue, streams, consumer groups and retry coordination |
-| PostgreSQL        | Durable job state                                          |
-| Prometheus Client | Application metrics                                        |
-| Docker            | Planned containerization                                   |
-| Git/GitHub        | Version control and project management                     |
-
----
-
-# Project Structure
+## Repository Structure
 
 ```text
 Cerberus/
-│
 ├── app/
-│   ├── main.py
-│   ├── worker.py
-│   ├── retry_scheduler.py
-│   ├── postgres_client.py
-│   ├── redis_client.py
-│   ├── metrics.py
-│   └── models.py
-│
-├── .env
+│   ├── main.py              # FastAPI app, POST /jobs, /metrics
+│   ├── worker.py            # Consumer, processing, retries, DLQ, idempotency, XAUTOCLAIM
+│   ├── retry_scheduler.py   # Moves due retries back to the main stream
+│   ├── postgres_client.py   # Job persistence
+│   ├── redis_client.py      # Redis connection setup
+│   ├── metrics.py           # Prometheus metrics
+│   └── models.py            # Request models
+├── tests/
+│   ├── test_main.py
+│   ├── test_worker.py
+│   └── test_retry_scheduler.py
+├── .env                     # Create locally; do not commit
 ├── .gitignore
+├── .dockerignore
+├── Dockerfile
+├── docker-compose.yml
+├── init.sql
 ├── requirements.txt
 └── README.md
 ```
 
-### `main.py`
+## Getting Started (Docker Compose)
 
-Contains the FastAPI application and job submission endpoint.
+### Prerequisites
 
-Responsibilities:
+- Git
+- Docker Desktop with Docker Compose
+- Python 3.10+ (only needed to run tests locally)
 
-* Accept job requests
-* Generate job IDs
-* Store jobs in PostgreSQL
-* Add jobs to Redis Streams
-* Expose Prometheus metrics
-
----
-
-### `worker.py`
-
-Contains the worker implementation.
-
-Responsibilities:
-
-* Join the Redis Consumer Group
-* Consume jobs
-* Process jobs
-* Acknowledge successful jobs
-* Detect failures
-* Schedule retries
-* Move permanently failing jobs to the DLQ
-* Perform idempotency checks
-* Reclaim abandoned jobs using `XAUTOCLAIM`
-
----
-
-### `retry_scheduler.py`
-
-Responsible for processing scheduled retries.
-
-Responsibilities:
-
-* Monitor `cerberus:retries`
-* Identify jobs whose retry time has arrived
-* Reinsert them into the main Redis Stream
-
----
-
-### `postgres_client.py`
-
-Handles PostgreSQL operations.
-
-Responsibilities:
-
-* Create job records
-* Update job status
-* Update attempt counts
-* Maintain timestamps
-
----
-
-### `redis_client.py`
-
-Contains Redis connection configuration and client initialization.
-
----
-
-### `metrics.py`
-
-Defines the Prometheus application metrics.
-
-Current metrics include:
-
-```text
-cerberus_jobs_submitted_total
-cerberus_jobs_completed_total
-cerberus_jobs_failed_total
-cerberus_jobs_retried_total
-cerberus_jobs_dead_lettered_total
-```
-
----
-
-### `models.py`
-
-Contains the request models used by the FastAPI application.
-
----
-
-# Installation
-
-## Prerequisites
-
-Install the following:
-
-* Python 3.10+
-* PostgreSQL
-* Redis
-* Git
-
-Optional:
-
-* Docker
-* Docker Compose
-
-Docker support is planned separately and is tracked as a GitHub issue.
-
----
-
-# Clone the Repository
+### 1. Clone the repository
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/shwetap3000/Cerberus.git
 cd Cerberus
 ```
 
----
+### 2. Configure environment variables
 
-# Create a Virtual Environment
-
-### Windows
-
-```powershell
-python -m venv .venv
-```
-
-Activate it:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
----
-
-# Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
----
-
-# PostgreSQL Setup
-
-Create a PostgreSQL database named:
-
-```text
-cerberus
-```
-
-Create the `jobs` table with the required fields:
-
-```sql
-CREATE TABLE jobs (
-    job_id UUID PRIMARY KEY,
-    job_type VARCHAR(100) NOT NULL,
-    payload JSONB NOT NULL,
-    status VARCHAR(50) NOT NULL,
-    attempts INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
----
-
-# Environment Configuration
-
-Create a `.env` file in the project root.
-
-Example:
+Create a `.env` file in the project root:
 
 ```env
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=cerberus
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=your_password
-
-REDIS_HOST=localhost
-REDIS_PORT=6379
+DATABASE_URL=postgresql://postgres:YOUR_POSTGRES_PASSWORD@localhost:5432/cerberus
+POSTGRES_PASSWORD=YOUR_POSTGRES_PASSWORD
+DB_HOST=localhost
+REDIS_HOST=redis
 ```
 
-Do not commit real passwords or secrets to GitHub.
+Replace the placeholder with your own local password. **Never commit `.env` or real credentials.** Docker Compose overrides `DB_HOST` to `postgres` inside the containers; `localhost` is used when running outside Docker.
 
-Make sure `.env` is included in `.gitignore`.
-
----
-
-# Running the System
-
-Cerberus currently consists of three application processes:
-
-```text
-FastAPI
-Worker
-Retry Scheduler
-```
-
-Redis and PostgreSQL must also be running.
-
----
-
-## 1. Start FastAPI
-
-From the project root:
+### 3. Build and start
 
 ```bash
-uvicorn app.main:app
+docker compose up --build -d
 ```
 
-The API will be available at:
-
-```text
-http://127.0.0.1:8000
-```
-
----
-
-## 2. Start a Worker
-
-Open another terminal.
-
-From the project root:
+| Service | Purpose |
+|---|---|
+| `api` | FastAPI application |
+| `worker` | Job-processing worker |
+| `retry-scheduler` | Requeues due retries |
+| `redis` | Streams, consumer group, retry and idempotency data |
+| `postgres` | Persistent job database |
 
 ```bash
-python -m app.worker worker-1
+docker compose ps                        # status
+docker compose logs -f api               # also: worker, retry-scheduler
+docker compose down                      # stop
+docker compose down -v                   # stop AND delete Redis/PostgreSQL volumes
 ```
 
-A second worker can be started with:
+> **Warning:** `docker compose down -v` permanently deletes local job data.
+
+To run more workers:
 
 ```bash
-python -m app.worker worker-2
+docker compose up -d --scale worker=3
 ```
 
-This allows multiple workers to participate in the same consumer group.
+## Running Without Docker
 
----
-
-## 3. Start the Retry Scheduler
-
-Open another terminal:
+Requires Python 3.10+, a running Redis and a running PostgreSQL with the `jobs` table from `init.sql`.
 
 ```bash
-python -m app.retry_scheduler
+python -m venv .venv
+.venv\Scripts\Activate.ps1            # Windows PowerShell
+pip install -r requirements.txt
+
+uvicorn app.main:app                  # terminal 1: API
+python -m app.worker worker-1         # terminal 2: worker (start worker-2 etc. for more)
+python -m app.retry_scheduler         # terminal 3: retry scheduler
 ```
 
-The scheduler is responsible for moving eligible retry jobs back into the main Redis Stream.
+## Submitting Jobs
 
----
-
-# Prometheus Multi-Process Setup
-
-When running FastAPI and workers as separate processes, set:
-
-```powershell
-$env:PROMETHEUS_MULTIPROC_DIR="$PWD\.metrics"
-```
-
-Create the directory if it does not exist:
-
-```powershell
-mkdir .metrics
-```
-
-The directory should be ignored by Git:
-
-```gitignore
-.metrics/
-```
-
-Before starting a fresh test run, clear old metric files:
-
-```powershell
-Remove-Item .metrics\* -Force -ErrorAction SilentlyContinue
-```
-
-Then set the environment variable in every terminal before starting the corresponding process.
-
----
-
-# API Documentation
-
-FastAPI automatically provides interactive API documentation.
-
-Once the server is running, open:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-The Swagger UI allows jobs to be submitted and tested without requiring an external API client.
-
----
-
-# Create a Job
-
-Endpoint:
-
-```text
-POST /jobs
-```
-
-Example request:
+Open the interactive docs at [http://localhost:8000/docs](http://localhost:8000/docs) and use `POST /jobs`:
 
 ```json
 {
   "type": "normal",
-  "payload": {
-    "message": "Hello Cerberus"
-  }
+  "payload": { "message": "Hello from Cerberus" }
 }
 ```
 
-Example response:
+Response:
 
 ```json
 {
-  "job_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "stream_id": "1234567890-0",
+  "job_id": "generated-uuid",
+  "stream_id": "generated-stream-id",
   "type": "normal",
-  "payload": {
-    "message": "Hello Cerberus"
-  },
+  "payload": { "message": "Hello from Cerberus" },
   "status": "queued"
 }
 ```
 
----
+## Demonstrating Failure Scenarios
 
-# Job Types Used for Testing
+The worker includes job types that exercise each execution path:
 
-Cerberus currently supports test job types that demonstrate different failure scenarios.
+| `type` | Behavior | What it demonstrates |
+|---|---|---|
+| `normal` | Completes successfully | Happy path, `XACK`, `completed` status |
+| `fail_once` | Fails on attempt 1, succeeds afterward | Retry scheduling and backoff |
+| `fail` | Fails every attempt | 5 attempts, then Dead Letter Queue |
+| `slow` | Takes longer to run | Worker crash and pending-job recovery |
 
-## Normal Job
+**Crash recovery demo:** start two workers, submit a `slow` job, kill the worker processing it, and watch the other worker reclaim the pending message via `XAUTOCLAIM` once the idle threshold passes.
 
-```json
-{
-  "type": "normal",
-  "payload": {
-    "message": "Successful job"
-  }
-}
+## Prometheus Metrics
+
+Metrics are exposed at [http://localhost:8000/metrics](http://localhost:8000/metrics).
+
+| Metric | Description |
+|---|---|
+| `cerberus_jobs_submitted_total` | Jobs successfully submitted |
+| `cerberus_jobs_completed_total` | Jobs completed successfully |
+| `cerberus_jobs_failed_total` | Job processing failures |
+| `cerberus_jobs_retried_total` | Retries scheduled |
+| `cerberus_jobs_dead_lettered_total` | Jobs moved to the DLQ |
+
+The API and workers are separate processes, and an in-memory Prometheus counter only exists inside the process that created it. To aggregate them, Cerberus uses the Prometheus client's multiprocess mode: `PROMETHEUS_MULTIPROC_DIR` points to a shared directory, and `/metrics` combines the data with a dedicated `CollectorRegistry` and `MultiProcessCollector`. When running locally without Docker, set the variable in every terminal before starting each process:
+
+```powershell
+mkdir .metrics
+$env:PROMETHEUS_MULTIPROC_DIR="$PWD\.metrics"
 ```
 
-Expected behavior:
+## Running Tests
 
-```text
-queued
-  ↓
-processing
-  ↓
-completed
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install pytest httpx      # if not already in requirements.txt
+python -m pytest -v
 ```
 
----
-
-## `fail_once`
-
-The `fail_once` job intentionally fails on its first attempt and succeeds on a later attempt.
-
-Example:
-
-```json
-{
-  "type": "fail_once",
-  "payload": {
-    "message": "Retry test"
-  }
-}
-```
-
-Expected behavior:
-
-```text
-Attempt 1
-   ↓
-Failure
-   ↓
-Retry scheduled
-   ↓
-Attempt 2
-   ↓
-Success
-```
-
-This is useful for testing the retry mechanism.
-
----
-
-## `fail`
-
-The `fail` job intentionally fails every time.
-
-Example:
-
-```json
-{
-  "type": "fail",
-  "payload": {
-    "message": "DLQ test"
-  }
-}
-```
-
-Expected behavior:
-
-```text
-Attempt 1 → Failure
-Attempt 2 → Failure
-Attempt 3 → Failure
-Attempt 4 → Failure
-Attempt 5 → Failure
-                 ↓
-                DLQ
-```
-
-This is useful for testing maximum attempts and Dead Letter Queue behavior.
-
----
-
-# Testing Failure Scenarios
-
-Cerberus was manually tested using Swagger, terminal logs, Redis and PostgreSQL.
-
----
-
-## Test 1: Successful Job
-
-Submit:
-
-```json
-{
-  "type": "normal",
-  "payload": {
-    "message": "Success test"
-  }
-}
-```
-
-Expected:
-
-```text
-PostgreSQL → completed
-Redis      → ACK
-Prometheus → jobs_completed_total increases
-```
-
----
-
-## Test 2: Retry
-
-Submit:
-
-```json
-{
-  "type": "fail_once",
-  "payload": {
-    "message": "Retry test"
-  }
-}
-```
-
-Expected:
-
-```text
-Attempt 1
-    ↓
-Failure
-    ↓
-Retry scheduled
-    ↓
-Retry Scheduler
-    ↓
-Redis Stream
-    ↓
-Worker
-    ↓
-Success
-```
-
-Prometheus should show increases in:
-
-```text
-cerberus_jobs_failed_total
-cerberus_jobs_retried_total
-cerberus_jobs_completed_total
-```
-
----
-
-## Test 3: Dead Letter Queue
-
-Submit:
-
-```json
-{
-  "type": "fail",
-  "payload": {
-    "message": "DLQ test"
-  }
-}
-```
-
-Expected:
-
-```text
-Attempt 1 → Failure
-Attempt 2 → Failure
-Attempt 3 → Failure
-Attempt 4 → Failure
-Attempt 5 → Failure
-     ↓
-Dead Letter Queue
-```
-
-Prometheus should show:
-
-```text
-cerberus_jobs_dead_lettered_total
-```
-
-increasing.
-
-PostgreSQL should show:
-
-```text
-status = dead_letter
-```
-
----
-
-## Test 4: Worker Crash Recovery
-
-Start at least two workers:
-
-```bash
-python -m app.worker worker-1
-```
-
-```bash
-python -m app.worker worker-2
-```
-
-Submit a job.
-
-During processing, terminate one worker.
-
-The job should remain pending in Redis.
-
-The remaining worker can reclaim the job using:
-
-```text
-XAUTOCLAIM
-```
-
-Expected flow:
-
-```text
-Worker 1
-   |
-   X
-Crash
-   |
-   v
-Pending Entry
-   |
-   v
-XAUTOCLAIM
-   |
-   v
-Worker 2
-   |
-   v
-Job processed
-```
-
-This demonstrates worker failure recovery.
-
----
-
-# Design Decisions
-
-## Why Redis Streams?
-
-Redis Streams were selected because they provide:
-
-* Persistent stream entries
-* Consumer groups
-* Message acknowledgement
-* Pending entry tracking
-* Consumer-level ownership
-* `XAUTOCLAIM` for recovering abandoned jobs
-
-This makes Redis Streams a good fit for implementing a reliable job queue while learning the underlying mechanisms.
-
----
-
-## Why Consumer Groups?
-
-Consumer groups allow multiple workers to share the workload.
-
-Instead of every worker processing every job:
-
-```text
-Job A → Worker 1
-Job B → Worker 2
-Job C → Worker 3
-```
-
-the consumer group distributes work across workers.
-
----
-
-## Why PostgreSQL?
-
-Redis is excellent for fast job coordination, but PostgreSQL provides durable structured state.
-
-PostgreSQL acts as the persistent record of:
-
-* Job status
-* Attempts
-* Payload
-* Creation time
-* Update time
-
-This separation keeps execution coordination and durable state distinct.
-
----
-
-## Why Not Celery or BullMQ?
-
-Cerberus intentionally implements the core mechanisms directly.
-
-Using an existing job framework would hide many of the concepts this project is designed to demonstrate.
-
-The project therefore implements:
-
-* Queueing
-* Consumer groups
-* Acknowledgement
-* Retry scheduling
-* Backoff
-* Jitter
-* Failure recovery
-* Idempotency
-* DLQ
-
-directly using Redis and Python.
-
----
-
-## Why No Worker Heartbeat?
-
-A worker heartbeat mechanism was considered but intentionally not included.
-
-Redis Streams already provide pending-entry tracking, and Cerberus uses `XAUTOCLAIM` to recover jobs that have remained idle for a configured period.
-
-The project therefore focuses on job-level recovery rather than introducing a separate worker-liveness subsystem.
-
----
-
-## Why No React Dashboard?
-
-A separate React dashboard was considered but intentionally excluded from the core project.
-
-Prometheus metrics are exposed through:
-
-```text
-/metrics
-```
-
-This keeps the project focused on the distributed job execution system rather than frontend development.
-
----
-
-# Current Limitations
-
-Cerberus is a learning and portfolio project and therefore has several limitations.
-
-### 1. No Authentication
-
-The API currently does not implement user authentication or authorization.
-
-### 2. No Production Deployment
-
-The project currently focuses on local development and demonstration.
-
-### 3. No Full Prometheus Server / Grafana Stack
-
-Application metrics are exposed through `/metrics`, but a complete Prometheus + Grafana monitoring stack is not currently included.
-
-### 4. No Automated Test Suite
-
-The project was primarily tested manually using:
-
-* Swagger
-* Redis
-* PostgreSQL
-* Worker logs
-* Prometheus metrics
-
-An automated test suite can be added later.
-
-### 5. No Worker Heartbeat
-
-Worker liveness is inferred through pending Redis Stream entries and `XAUTOCLAIM`.
-
-### 6. No Web Dashboard
-
-There is currently no dedicated React dashboard.
-
----
-
-# Future Improvements
-
-The following improvements can be added in future iterations.
-
-## Docker and Docker Compose
-
-Tracked separately as a GitHub issue.
-
-The planned architecture is:
-
-```text
-Docker Compose
-      |
-      +-- FastAPI
-      +-- Worker
-      +-- Retry Scheduler
-      +-- Redis
-      +-- PostgreSQL
-```
-
-The goal is to start the complete system using:
-
-```bash
-docker compose up --build
-```
-
----
-
-## Automated Testing
-
-Add a comprehensive test suite using `pytest`.
-
-Potential test cases:
-
-* Job creation
-* Successful processing
-* Retry behavior
-* Exponential backoff
-* Jitter
-* Maximum attempts
-* DLQ behavior
-* Idempotency
-* Worker crash recovery
-
----
-
-## Prometheus + Grafana
-
-A complete monitoring stack could be added:
-
-```text
-Cerberus
-    |
-    v
-Prometheus
-    |
-    v
-Grafana
-```
-
-This would allow dashboards for:
-
-* Job throughput
-* Failure rate
-* Retry rate
-* DLQ rate
-* Processing latency
-* Worker activity
-
----
-
-## Job Priorities
-
-Jobs could support priority levels such as:
-
-```text
-high
-medium
-low
-```
-
----
-
-## Scheduled Jobs
-
-Support jobs that execute at a specified future time.
-
----
-
-## Job Cancellation
-
-Add an API endpoint for cancelling jobs that have not yet started.
-
----
-
-## Horizontal Scaling
-
-Run multiple worker instances to increase processing throughput.
-
-For example:
-
-```text
-            Redis
-              |
-      +-------+-------+
-      |       |       |
-   Worker 1 Worker 2 Worker 3
-```
-
----
-
-# Learning Outcomes
-
-Building Cerberus provided practical experience with several distributed-systems concepts.
-
-## Redis
-
-* Redis Streams
-* Consumer Groups
-* Pending Entries
-* `XACK`
-* `XAUTOCLAIM`
-* Sorted Sets
-* Retry scheduling
-
-## Distributed Systems
-
-* Worker failure recovery
-* At-least-once delivery concepts
-* Duplicate processing
-* Idempotency
-* Retry strategies
-* Backoff
-* Jitter
-* Dead Letter Queues
-* Multi-worker coordination
-
-## Backend Development
-
-* FastAPI
-* REST APIs
-* Request validation
-* Background processing
-* PostgreSQL integration
-
-## Observability
-
-* Prometheus counters
-* Application metrics
-* Multi-process metric collection
-* Monitoring job execution behavior
-
-## Software Engineering
-
-* Modular project structure
-* Git version control
-* Incremental development
-* Failure-oriented testing
-* System design
-
----
-
-# Git Development Approach
-
-Cerberus was developed incrementally, with major features committed as separate checkpoints.
-
-The development focused on implementing and validating each reliability mechanism before moving to the next one.
-
-Major milestones included:
-
-```text
-FastAPI Job Submission
-        ↓
-Redis Streams
-        ↓
-Consumer Groups
-        ↓
-Multiple Workers
-        ↓
-Acknowledgement
-        ↓
-Worker Crash Recovery
-        ↓
-Retries
-        ↓
-Exponential Backoff
-        ↓
-Retry Jitter
-        ↓
-Maximum Attempts
-        ↓
-Dead Letter Queue
-        ↓
-Idempotency
-        ↓
-PostgreSQL State
-        ↓
-Prometheus Metrics
-        ↓
-Multi-Process Metrics
-```
-
-This approach made it easier to isolate problems and verify each distributed-system concept independently.
-
----
-
-# Project Status
-
-## Completed
-
-* [x] FastAPI job submission
-* [x] Redis Streams
-* [x] Redis Consumer Groups
-* [x] Multiple workers
-* [x] Job acknowledgement
-* [x] Pending job handling
-* [x] Worker crash recovery
-* [x] `XAUTOCLAIM`
-* [x] Automatic retries
-* [x] Retry scheduler
-* [x] Exponential backoff
-* [x] Retry jitter
-* [x] Maximum attempts
-* [x] Dead Letter Queue
-* [x] Idempotency
-* [x] PostgreSQL durable state
-* [x] Job status tracking
-* [x] Attempt tracking
-* [x] Prometheus metrics
-* [x] Multi-process Prometheus metrics
-* [x] Successful job testing
-* [x] Retry testing
-* [x] DLQ testing
-* [x] Worker failure recovery testing
-
-## Planned
-
-* [ ] Dockerfile
-* [ ] Docker Compose
-* [ ] Containerized Redis
-* [ ] Containerized PostgreSQL
-* [ ] Containerized FastAPI
-* [ ] Containerized workers
-* [ ] Containerized retry scheduler
-* [ ] Automated tests
-* [ ] Grafana dashboard
-
----
-
-# Conclusion
-
-Cerberus is a fault-tolerant distributed job execution system designed to explore how reliable background processing systems work internally.
-
-The project demonstrates how multiple technologies can be combined to provide reliable asynchronous job processing:
-
-```text
-                    +----------------+
-                    |    FastAPI     |
-                    +-------+--------+
-                            |
-                            v
-                    +---------------+
-                    | Redis Stream  |
-                    +-------+-------+
-                            |
-                  +---------+---------+
-                  |                   |
-                  v                   v
-             Worker 1             Worker 2
-                  |                   |
-                  +---------+---------+
-                            |
-                 +----------+----------+
-                 |                     |
-              Success                Failure
-                 |                     |
-                ACK               Retry / DLQ
-                                       |
-                                       v
-                               Retry Scheduler
-                                       |
-                                       v
-                                  Redis ZSET
-
-
-                    PostgreSQL
-                         ^
-                         |
-                    Job State
-
-
-                    Prometheus
-                         ^
-                         |
-                      /metrics
-```
-
-The key reliability mechanisms implemented by Cerberus are:
-
-```text
-Redis Streams
-      +
-Consumer Groups
-      +
-Acknowledgements
-      +
-XAUTOCLAIM
-      +
-Retries
-      +
-Exponential Backoff
-      +
-Jitter
-      +
-Idempotency
-      +
-Dead Letter Queue
-      +
-PostgreSQL
-      +
-Prometheus
-```
-
-Together, these mechanisms allow Cerberus to continue processing jobs despite worker failures, transient errors, duplicate deliveries, and permanently failing jobs.
-
-The project serves as a practical exploration of distributed job processing, fault tolerance, reliability engineering, and backend system design.
+The suite contains **9 tests**:
+
+| Area | What is checked | Count |
+|---|---|---:|
+| API | Valid job submission, invalid request validation | 2 |
+| Worker | Successful processing, idempotency, retry scheduling, DLQ handling, pending-job recovery call | 5 |
+| Retry Scheduler | Fetching due retries, moving a retry back to the main stream | 2 |
+| **Total** | | **9** |
+
+**Testing scope:** these tests mock Redis and PostgreSQL and verify application logic. They do not prove end-to-end behavior against live services. Failure scenarios (retry, DLQ, worker crash recovery) were exercised manually using Swagger, worker logs, Redis and Prometheus metrics.
+
+## Design Decisions
+
+- **Why Redis Streams?** They provide consumer groups, acknowledgements, pending-entry tracking and `XAUTOCLAIM`, which are the primitives needed to build a reliable queue directly.
+- **Why PostgreSQL alongside Redis?** Redis coordinates execution; PostgreSQL keeps durable, queryable job state (status, attempts, timestamps).
+- **Why not Celery or BullMQ?** The goal was to understand and implement queueing, acknowledgement, retries, backoff, idempotency and recovery, which a framework would hide.
+- **Why a DLQ?** It isolates permanently failing jobs so they stop consuming retries and can be inspected separately.
+- **Why no worker heartbeat?** Redis already tracks pending entries, so Cerberus recovers at the job level with `XAUTOCLAIM` instead of building a separate worker-liveness system.
+- **Why no frontend dashboard?** Metrics are exposed via `/metrics`; a dashboard was kept out of scope to stay focused on the backend.
+
+## Known Limitations
+
+Cerberus is a portfolio and learning project, not a production-hardened job platform.
+
+- **No end-to-end persistence verification:** the API-to-PostgreSQL path still needs a conclusive integration check against the running Docker services.
+- **Not exactly-once:** Redis Streams plus idempotency keys reduce duplicate execution, but delivery is at-least-once.
+- **Non-atomic failure windows:** a crash between separate Redis operations (for example retry scheduling and acknowledgement) can still create edge cases.
+- **No authentication or authorization** on the API.
+- **No bundled Prometheus server or Grafana dashboards**; only the `/metrics` endpoint is provided.
+- **Local/demo deployment only**; not configured for production.
+
+## Future Improvements
+
+- Integration tests against real Redis and PostgreSQL.
+- Atomic retry scheduling and acknowledgement (for example Lua scripts or transactions).
+- Authentication and authorization.
+- Prometheus server and Grafana dashboards.
+- Job cancellation, priorities and scheduled jobs.
+- Further operational safeguards for production deployment.
+
+## Learning Outcomes
+
+- Redis Streams, consumer groups, pending entries, `XACK` and `XAUTOCLAIM`
+- Retry scheduling with Sorted Sets, exponential backoff and jitter
+- Idempotency, duplicate-delivery handling and at-least-once semantics
+- Dead Letter Queues and failure-path design
+- FastAPI request validation and REST API development
+- PostgreSQL persistence for durable job state
+- Prometheus metrics, including multiprocess collection
+- Docker Compose multi-service environments
+- Testing with pytest and mocks
+
+## Author
+
+**[shwetap3000](https://github.com/shwetap3000)**: [github.com/shwetap3000/Cerberus](https://github.com/shwetap3000/Cerberus)
